@@ -2,11 +2,12 @@ import ast
 from collections import Counter
 from typing import Tuple
 
+import Levenshtein
 # todo: remove unused imports
 from torch.utils.data import Dataset, DataLoader
-
+from transformers import EvalPrediction, EarlyStoppingCallback
 import pandas as pd
-from transformers import T5Tokenizer, T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import T5Tokenizer, T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments, DataCollatorForSeq2Seq
 import torch.nn.functional as F
 import os
 import shutil
@@ -91,8 +92,8 @@ class T5_doc_vqa:
 
         # CONSTANTS
         self.MAX_TOKENIZER_LENGTH = 512
-        self.LEARNING_RATE = 3e-4
-        self.MAX_EPOCHS = 5
+        self.LEARNING_RATE = 3e-6
+        self.MAX_EPOCHS = 2
         self.BATCH_SIZE = 4
         self.MODEL_FILE_NAME = "t5"
         # END CONSTANTS
@@ -107,7 +108,7 @@ class T5_doc_vqa:
             # self.model = BertForSequenceClassification.from_pretrained(
             #     "bert-base-multilingual-cased", num_labels=2
             # )
-            self.model = T5ForConditionalGeneration.from_pretrained("t5-base")
+            self.model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base")
             self.model.load_state_dict(torch.load(model_path))
             self.model.eval()
         # define the one-hot encoder, all the labels will be convert into one-hot version during the training and prediction
@@ -140,7 +141,37 @@ class T5_doc_vqa:
 
         model_inputs["labels"] = labels["input_ids"]
         return model_inputs
+    def normalized_levenshtein_similarity(self, s1, s2):
+        s1, s2 = str(s1).lower().strip(), str(s2).lower().strip()
+        dist = Levenshtein.distance(s1, s2)
+        max_len = max(len(s1), len(s2))
+        if max_len == 0:
+            return 1.0
+        return 1 - (dist / max_len)
+    def compute_metrics(self, eval_pred: EvalPrediction):
+        preds, labels = eval_pred
+        
+    
+        decoded_preds = self.tokenizer.batch_decode([pred[pred != -100] for pred in preds], skip_special_tokens=True)
+        decoded_labels = self.tokenizer.batch_decode([label[label != -100] for label in labels], skip_special_tokens=True)
 
+        # Clean text
+        decoded_preds = [pred.strip().lower() for pred in decoded_preds]
+        decoded_labels = [label.strip().lower() for label in decoded_labels]
+        
+        # Compute Levenshtein similarity
+        similarities = [
+            self.normalized_levenshtein_similarity(pred, label)
+            for pred, label in zip(decoded_preds, decoded_labels)
+        ]
+        exact_matches = [
+            pred == label for pred, label in zip(decoded_preds, decoded_labels)
+        ]
+
+        return {
+            "levenshtein_similarity": sum(similarities) / len(similarities),
+            "exact_match": sum(exact_matches) / len(exact_matches)
+        }
 
     def train(self):
         # Load dataset
@@ -156,19 +187,28 @@ class T5_doc_vqa:
         self.model.to(device)
 
         # Training arguments
+        data_collator = DataCollatorForSeq2Seq(self.tokenizer, model=self.model)
         training_args = Seq2SeqTrainingArguments(
-            output_dir="./t5-docvqa",
-            evaluation_strategy="epoch",
+            output_dir="./flan-t5-docvqa",
+            eval_strategy="epoch",
             save_strategy="epoch",
-            learning_rate=3e-4,
+            learning_rate=self.LEARNING_RATE,
+            logging_steps=50,
             per_device_train_batch_size=self.BATCH_SIZE,
             per_device_eval_batch_size=self.BATCH_SIZE,
-            gradient_accumulation_steps=self.BATCH_SIZE,  # Adjust for GPU memory
+            gradient_accumulation_steps=4,
             num_train_epochs=self.MAX_EPOCHS,
+            gradient_checkpointing=True,
             weight_decay=0.01,
             save_total_limit=2,
             load_best_model_at_end=True,
-            fp16=torch.cuda.is_available(),
+            metric_for_best_model="levenshtein_similarity",
+            greater_is_better=True,
+            eval_accumulation_steps=1,  # Adjust this based on your memory constraints
+            predict_with_generate=True,
+            generation_max_length=64,
+            generation_num_beams=4,
+            fp16=True,
         )
 
         # Trainer
@@ -177,10 +217,14 @@ class T5_doc_vqa:
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=valid_dataset,
-            tokenizer=self.tokenizer
+            tokenizer=self.tokenizer,
+            data_collator=data_collator,
+            compute_metrics=self.compute_metrics
         )
-
+       
+        # trainer.add_callback(EarlyStoppingCallback(early_stopping_patience=2)) 
         # Train the model
         trainer.train()
+
 
         
