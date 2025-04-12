@@ -1,5 +1,6 @@
 *\data
-*.txt
+huggingface_token.txt
 *\OCR
 *.csv
 *\t5-docvqa
+openai.key
